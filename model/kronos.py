@@ -386,7 +386,7 @@ def sample_from_logits(logits, temperature=1.0, top_k=None, top_p=None, sample_l
     return x
 
 
-def auto_regressive_inference(tokenizer, model, x, x_stamp, y_stamp, max_context, pred_len, clip=5, T=1.0, top_k=0, top_p=0.99, sample_count=5, verbose=False):
+def auto_regressive_inference(tokenizer, model, x, x_stamp, y_stamp, max_context, pred_len, clip=5, T=1.0, top_k=0, top_p=0.99, sample_count=5, verbose=False, return_all_samples=False):
     with torch.no_grad():
         x = torch.clip(x, -clip, clip)
 
@@ -464,19 +464,32 @@ def auto_regressive_inference(tokenizer, model, x, x_stamp, y_stamp, max_context
         z = tokenizer.decode(input_tokens, half=True)
         z = z.reshape(-1, sample_count, z.size(1), z.size(2))
         preds = z.cpu().numpy()
+        if return_all_samples:
+            return preds
         preds = np.mean(preds, axis=1)
 
         return preds
 
 
 def calc_time_stamps(x_timestamp):
-    time_df = pd.DataFrame()
-    time_df['minute'] = x_timestamp.dt.minute
-    time_df['hour'] = x_timestamp.dt.hour
-    time_df['weekday'] = x_timestamp.dt.weekday
-    time_df['day'] = x_timestamp.dt.day
-    time_df['month'] = x_timestamp.dt.month
-    return time_df
+    """Extract calendar features from a Series or DatetimeIndex (e.g. pd.bdate_range)."""
+    if isinstance(x_timestamp, pd.DatetimeIndex):
+        ts = x_timestamp
+    elif isinstance(x_timestamp, pd.Series):
+        ts = pd.DatetimeIndex(pd.to_datetime(x_timestamp, errors='coerce'))
+    else:
+        ts = pd.DatetimeIndex(pd.to_datetime(x_timestamp, errors='coerce'))
+
+    if ts.hasnans:
+        raise ValueError('calc_time_stamps received invalid or NaT timestamps')
+
+    return pd.DataFrame({
+        'minute': ts.minute,
+        'hour': ts.hour,
+        'weekday': ts.dayofweek,
+        'day': ts.day,
+        'month': ts.month,
+    })
 
 
 class KronosPredictor:
@@ -505,19 +518,21 @@ class KronosPredictor:
         self.tokenizer = self.tokenizer.to(self.device)
         self.model = self.model.to(self.device)
 
-    def generate(self, x, x_stamp, y_stamp, pred_len, T, top_k, top_p, sample_count, verbose):
+    def generate(self, x, x_stamp, y_stamp, pred_len, T, top_k, top_p, sample_count, verbose, return_all_samples=False):
 
         x_tensor = torch.from_numpy(np.array(x).astype(np.float32)).to(self.device)
         x_stamp_tensor = torch.from_numpy(np.array(x_stamp).astype(np.float32)).to(self.device)
         y_stamp_tensor = torch.from_numpy(np.array(y_stamp).astype(np.float32)).to(self.device)
 
         preds = auto_regressive_inference(self.tokenizer, self.model, x_tensor, x_stamp_tensor, y_stamp_tensor, self.max_context, pred_len,
-                                          self.clip, T, top_k, top_p, sample_count, verbose)
+                                          self.clip, T, top_k, top_p, sample_count, verbose, return_all_samples=return_all_samples)
+        if return_all_samples:
+            return preds[:, :, -pred_len:, :]
         preds = preds[:, -pred_len:, :]
         return preds
 
-    def predict(self, df, x_timestamp, y_timestamp, pred_len, T=1.0, top_k=0, top_p=0.9, sample_count=1, verbose=True):
-
+    def _prepare_predict_arrays(self, df, x_timestamp, y_timestamp):
+        """Shared preprocessing for predict / predict_with_sample_returns."""
         if not isinstance(df, pd.DataFrame):
             raise ValueError("Input must be a pandas DataFrame.")
 
@@ -526,8 +541,8 @@ class KronosPredictor:
 
         df = df.copy()
         if self.vol_col not in df.columns:
-            df[self.vol_col] = 0.0  # Fill missing volume with zeros
-            df[self.amt_vol] = 0.0  # Fill missing amount with zeros
+            df[self.vol_col] = 0.0
+            df[self.amt_vol] = 0.0
         if self.amt_vol not in df.columns and self.vol_col in df.columns:
             df[self.amt_vol] = df[self.vol_col] * df[self.price_cols].mean(axis=1)
 
@@ -542,20 +557,75 @@ class KronosPredictor:
         y_stamp = y_time_df.values.astype(np.float32)
 
         x_mean, x_std = np.mean(x, axis=0), np.std(x, axis=0)
+        x_norm = (x - x_mean) / (x_std + 1e-5)
+        x_norm = np.clip(x_norm, -self.clip, self.clip)
 
-        x = (x - x_mean) / (x_std + 1e-5)
-        x = np.clip(x, -self.clip, self.clip)
+        return (
+            x_norm[np.newaxis, :],
+            x_stamp[np.newaxis, :],
+            y_stamp[np.newaxis, :],
+            x_mean,
+            x_std,
+            y_timestamp,
+        )
 
-        x = x[np.newaxis, :]
-        x_stamp = x_stamp[np.newaxis, :]
-        y_stamp = y_stamp[np.newaxis, :]
+    def predict_with_sample_returns(
+        self,
+        df,
+        x_timestamp,
+        y_timestamp,
+        pred_len,
+        T=1.0,
+        top_k=0,
+        top_p=0.9,
+        sample_count=1,
+        verbose=False,
+    ):
+        """Single batched inference; returns mean path DataFrame and per-sample terminal simple returns."""
+        x, x_stamp, y_stamp, x_mean, x_std, y_ts = self._prepare_predict_arrays(df, x_timestamp, y_timestamp)
+        sample_count = max(1, int(sample_count))
+        last_close = float(df["close"].iloc[-1]) if "close" in df.columns and len(df) else 0.0
+
+        if sample_count <= 1:
+            pred_df = self.predict(
+                df, x_timestamp, y_timestamp, pred_len, T=T, top_k=top_k, top_p=top_p,
+                sample_count=1, verbose=verbose,
+            )
+            terminal = float(pred_df["close"].iloc[-1])
+            tr = (terminal / last_close - 1.0) if last_close else 0.0
+            return pred_df, [tr]
+
+        preds_all = self.generate(
+            x, x_stamp, y_stamp, pred_len, T, top_k, top_p, sample_count, verbose,
+            return_all_samples=True,
+        )
+        preds_all = preds_all.squeeze(0)
+        preds_all = preds_all * (x_std + 1e-5) + x_mean
+
+        close_idx = self.price_cols.index("close") if "close" in self.price_cols else 3
+        terminal_returns = []
+        for i in range(sample_count):
+            terminal = float(preds_all[i, -1, close_idx])
+            terminal_returns.append((terminal / last_close - 1.0) if last_close else 0.0)
+
+        mean_preds = np.mean(preds_all, axis=0)
+        pred_df = pd.DataFrame(
+            mean_preds,
+            columns=self.price_cols + [self.vol_col, self.amt_vol],
+            index=y_ts,
+        )
+        return pred_df, terminal_returns
+
+    def predict(self, df, x_timestamp, y_timestamp, pred_len, T=1.0, top_k=0, top_p=0.9, sample_count=1, verbose=True):
+
+        x, x_stamp, y_stamp, x_mean, x_std, y_ts = self._prepare_predict_arrays(df, x_timestamp, y_timestamp)
 
         preds = self.generate(x, x_stamp, y_stamp, pred_len, T, top_k, top_p, sample_count, verbose)
 
         preds = preds.squeeze(0)
         preds = preds * (x_std + 1e-5) + x_mean
 
-        pred_df = pd.DataFrame(preds, columns=self.price_cols + [self.vol_col, self.amt_vol], index=y_timestamp)
+        pred_df = pd.DataFrame(preds, columns=self.price_cols + [self.vol_col, self.amt_vol], index=y_ts)
         return pred_df
 
 
