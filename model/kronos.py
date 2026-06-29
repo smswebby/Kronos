@@ -581,10 +581,11 @@ class KronosPredictor:
         sample_count=1,
         verbose=False,
     ):
-        """Single batched inference; returns mean path DataFrame and per-sample terminal simple returns."""
+        """Single batched inference; returns mean path DataFrame, per-sample terminal simple returns, and per-sample close paths."""
         x, x_stamp, y_stamp, x_mean, x_std, y_ts = self._prepare_predict_arrays(df, x_timestamp, y_timestamp)
         sample_count = max(1, int(sample_count))
         last_close = float(df["close"].iloc[-1]) if "close" in df.columns and len(df) else 0.0
+        close_idx = self.price_cols.index("close") if "close" in self.price_cols else 3
 
         if sample_count <= 1:
             pred_df = self.predict(
@@ -593,7 +594,8 @@ class KronosPredictor:
             )
             terminal = float(pred_df["close"].iloc[-1])
             tr = (terminal / last_close - 1.0) if last_close else 0.0
-            return pred_df, [tr]
+            sample_close_paths = pred_df["close"].astype(float).to_numpy()[np.newaxis, :]
+            return pred_df, [tr], sample_close_paths
 
         preds_all = self.generate(
             x, x_stamp, y_stamp, pred_len, T, top_k, top_p, sample_count, verbose,
@@ -602,10 +604,10 @@ class KronosPredictor:
         preds_all = preds_all.squeeze(0)
         preds_all = preds_all * (x_std + 1e-5) + x_mean
 
-        close_idx = self.price_cols.index("close") if "close" in self.price_cols else 3
+        sample_close_paths = preds_all[:, :, close_idx].astype(np.float64)
         terminal_returns = []
         for i in range(sample_count):
-            terminal = float(preds_all[i, -1, close_idx])
+            terminal = float(sample_close_paths[i, -1])
             terminal_returns.append((terminal / last_close - 1.0) if last_close else 0.0)
 
         mean_preds = np.mean(preds_all, axis=0)
@@ -614,7 +616,7 @@ class KronosPredictor:
             columns=self.price_cols + [self.vol_col, self.amt_vol],
             index=y_ts,
         )
-        return pred_df, terminal_returns
+        return pred_df, terminal_returns, sample_close_paths
 
     def predict(self, df, x_timestamp, y_timestamp, pred_len, T=1.0, top_k=0, top_p=0.9, sample_count=1, verbose=True):
 

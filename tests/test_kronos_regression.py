@@ -87,6 +87,53 @@ def test_kronos_predictor_regression(context_len):
 
     np.testing.assert_allclose(obtained, expected, rtol=REL_TOLERANCE)
 
+
+@pytest.mark.parametrize("context_len", TEST_CTX_LEN)
+def test_predict_with_sample_returns_close_paths(context_len):
+    set_seed(SEED)
+
+    expected_output_path = OUTPUT_DATA_DIR / f"regression_output_{context_len}.csv"
+    df = pd.read_csv(INPUT_DATA_PATH, parse_dates=["timestamps"])
+    expected_df = pd.read_csv(expected_output_path, parse_dates=["timestamps"])
+
+    if df.shape[0] < context_len + len(expected_df):
+        raise ValueError("Example data does not contain enough rows for the regression test.")
+
+    context_df = df.iloc[:context_len].copy()
+    context_features = context_df[FEATURE_NAMES].reset_index(drop=True)
+    x_timestamp = context_df["timestamps"].reset_index(drop=True)
+    future_timestamp = df["timestamps"].iloc[context_len:context_len + len(expected_df)].reset_index(drop=True)
+    pred_len = expected_df.shape[0]
+    sample_count = 3
+
+    tokenizer = KronosTokenizer.from_pretrained("NeoQuasar/Kronos-Tokenizer-base", revision=TOKENIZER_REVISION)
+    model = Kronos.from_pretrained("NeoQuasar/Kronos-small", revision=MODEL_REVISION)
+    tokenizer.eval()
+    model.eval()
+
+    predictor = KronosPredictor(model, tokenizer, device=DEVICE, max_context=MAX_CTX_LEN)
+
+    with torch.no_grad():
+        pred_df, terminal_returns, sample_close_paths = predictor.predict_with_sample_returns(
+            df=context_features,
+            x_timestamp=x_timestamp,
+            y_timestamp=future_timestamp,
+            pred_len=pred_len,
+            T=1.0,
+            top_k=1,
+            top_p=1.0,
+            verbose=False,
+            sample_count=sample_count,
+        )
+
+    assert sample_close_paths.shape == (sample_count, pred_len)
+    assert len(terminal_returns) == sample_count
+    np.testing.assert_allclose(
+        np.mean(sample_close_paths, axis=0),
+        pred_df["close"].astype(float).to_numpy(),
+        rtol=REL_TOLERANCE,
+    )
+
 @pytest.mark.parametrize("context_len, expected_mse", zip(MSE_CTX_LEN, MSE_EXPECTED))
 def test_kronos_predictor_mse(context_len, expected_mse):
     set_seed(SEED)
